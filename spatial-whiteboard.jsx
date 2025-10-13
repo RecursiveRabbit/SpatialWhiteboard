@@ -47,6 +47,7 @@ const Radio = ({ size = 24, ...props }) => (
 const SpatialWhiteboard = () => {
   const canvasRef = useRef(null);
   const audioContextRef = useRef(null);
+  const socketRef = useRef(null);
   const [users, setUsers] = useState([]);
   const [myId, setMyId] = useState(null);
   const [myName, setMyName] = useState('');
@@ -60,12 +61,17 @@ const SpatialWhiteboard = () => {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [showUserList, setShowUserList] = useState(true);
   const [roomId, setRoomId] = useState('');
-  const [vdoReady, setVdoReady] = useState(false);
-  
-  // VDO.Ninja refs
-  const vdoIframeRef = useRef(null);
-  const audioNodesRef = useRef({}); // Store audio nodes for each peer
-  const peerStreamsRef = useRef({}); // Store MediaStream for each peer
+  const [wsConnected, setWsConnected] = useState(false);
+  const [webrtcReady, setWebrtcReady] = useState(false);
+
+  // WebRTC refs
+  const localStreamRef = useRef(null);
+  const peerConnectionsRef = useRef({}); // { userId: RTCPeerConnection }
+  const audioNodesRef = useRef({}); // { userId: { source, gainNode, panNode } }
+
+  // Interpolation refs - track target positions for smooth movement
+  const targetPositionsRef = useRef({}); // { userId: { x, y, vx, vy } }
+  const displayPositionsRef = useRef({}); // Current rendered positions
 
   // Constants
   const TOKEN_RADIUS = 30;
@@ -89,81 +95,344 @@ const SpatialWhiteboard = () => {
     setRoomId(randomRoom);
   }, []);
 
-  // Handle VDO.Ninja messages
+  // Initialize local audio stream
   useEffect(() => {
-    const handleMessage = (event) => {
-      // Only accept messages from vdo.ninja
-      if (!event.origin.includes('vdo.ninja')) return;
-      
-      const data = event.data;
-      
-      // Track added - new peer joined
-      if (data.action === 'track-added') {
-        console.log('New peer track added:', data);
-        const peerId = data.UUID;
-        const stream = data.stream;
-        
-        if (stream && audioContextRef.current) {
-          // Create audio processing chain for this peer
-          const source = audioContextRef.current.createMediaStreamSource(stream);
-          const gainNode = audioContextRef.current.createGain();
-          const panNode = audioContextRef.current.createStereoPanner();
-          
-          source.connect(gainNode);
-          gainNode.connect(panNode);
-          panNode.connect(audioContextRef.current.destination);
-          
-          // Store nodes for this peer
-          audioNodesRef.current[peerId] = { gainNode, panNode, source };
-          peerStreamsRef.current[peerId] = stream;
-          
-          // Add user to list if not already there
-          setUsers(prev => {
-            if (prev.find(u => u.id === peerId)) return prev;
-            return [...prev, {
-              id: peerId,
-              name: data.label || `User ${peerId.substr(0, 4)}`,
-              x: Math.random() * 1000 + 500,
-              y: Math.random() * 800 + 300,
-              color: `hsl(${Math.random() * 360}, 70%, 60%)`,
-              isSpeaking: false,
-              isMuted: false,
-              isAdmin: false,
-              megaphoneActive: false
-            }];
-          });
-        }
-      }
-      
-      // Track removed - peer left
-      if (data.action === 'track-removed') {
-        console.log('Peer track removed:', data);
-        const peerId = data.UUID;
-        
-        // Clean up audio nodes
-        if (audioNodesRef.current[peerId]) {
-          const { source, gainNode, panNode } = audioNodesRef.current[peerId];
-          source.disconnect();
-          gainNode.disconnect();
-          panNode.disconnect();
-          delete audioNodesRef.current[peerId];
-          delete peerStreamsRef.current[peerId];
-        }
-        
-        // Remove user from list
-        setUsers(prev => prev.filter(u => u.id !== peerId));
-      }
-      
-      // VDO.Ninja is ready
-      if (data.action === 'ready') {
-        console.log('VDO.Ninja iframe ready');
-        setVdoReady(true);
+    if (!joined) return;
+
+    const startAudio = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        });
+        localStreamRef.current = stream;
+        setWebrtcReady(true);
+        console.log('Local audio stream started');
+      } catch (error) {
+        console.error('Failed to get microphone:', error);
+        alert('Microphone access denied. You need to grant permission to use audio.');
       }
     };
-    
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
+
+    startAudio();
+
+    return () => {
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [joined]);
+
+  // WebSocket connection
+  useEffect(() => {
+    if (!joined) return;
+
+    // Connect to Socket.io server
+    const socket = io('http://localhost:3000');
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('WebSocket connected');
+      setWsConnected(true);
+
+      // Join the room
+      const me = users.find(u => u.id === myId);
+      if (me) {
+        socket.emit('join-room', { roomId, user: me });
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('WebSocket disconnected');
+      setWsConnected(false);
+    });
+
+    // Receive existing users in room
+    socket.on('room-state', ({ users: existingUsers }) => {
+      console.log('Received room state:', existingUsers);
+
+      // Initialize interpolation positions for existing users
+      existingUsers.forEach(user => {
+        displayPositionsRef.current[user.id] = { x: user.x, y: user.y };
+        targetPositionsRef.current[user.id] = { x: user.x, y: user.y, vx: 0, vy: 0 };
+      });
+
+      setUsers(prev => {
+        // Merge existing users with current user
+        const myUser = prev.find(u => u.id === myId);
+        return myUser ? [myUser, ...existingUsers] : existingUsers;
+      });
+    });
+
+    // New user joined
+    socket.on('user-joined', (user) => {
+      console.log('User joined:', user);
+
+      // Initialize interpolation positions for new user
+      displayPositionsRef.current[user.id] = { x: user.x, y: user.y };
+      targetPositionsRef.current[user.id] = { x: user.x, y: user.y, vx: 0, vy: 0 };
+
+      setUsers(prev => {
+        if (prev.find(u => u.id === user.id)) return prev;
+        return [...prev, user];
+      });
+    });
+
+    // User moved - store target position for interpolation
+    socket.on('user-moved', ({ userId, x, y }) => {
+      // Initialize display position if first time seeing this user move
+      if (!displayPositionsRef.current[userId]) {
+        displayPositionsRef.current[userId] = { x, y };
+      }
+
+      // Set target position with velocity for spring physics
+      const current = displayPositionsRef.current[userId];
+      targetPositionsRef.current[userId] = {
+        x,
+        y,
+        vx: targetPositionsRef.current[userId]?.vx || 0,
+        vy: targetPositionsRef.current[userId]?.vy || 0
+      };
+    });
+
+    // User state changed
+    socket.on('user-state-changed', ({ userId, ...state }) => {
+      setUsers(prev => prev.map(u =>
+        u.id === userId ? { ...u, ...state } : u
+      ));
+    });
+
+    // User left
+    socket.on('user-left', (userId) => {
+      console.log('User left:', userId);
+
+      // Clean up interpolation data
+      delete displayPositionsRef.current[userId];
+      delete targetPositionsRef.current[userId];
+
+      // Clean up WebRTC connection
+      closePeerConnection(userId);
+
+      setUsers(prev => prev.filter(u => u.id !== userId));
+    });
+
+    // WebRTC signaling handlers
+    socket.on('webrtc-offer', async ({ from, offer }) => {
+      console.log('Received WebRTC offer from', from);
+      await handleWebRTCOffer(from, offer);
+    });
+
+    socket.on('webrtc-answer', async ({ from, answer }) => {
+      console.log('Received WebRTC answer from', from);
+      await handleWebRTCAnswer(from, answer);
+    });
+
+    socket.on('webrtc-ice-candidate', async ({ from, candidate }) => {
+      await handleICECandidate(from, candidate);
+    });
+
+    return () => {
+      // Clean up all peer connections
+      Object.keys(peerConnectionsRef.current).forEach(userId => {
+        closePeerConnection(userId);
+      });
+      socket.disconnect();
+    };
+  }, [joined, myId, roomId]);
+
+  // Smooth interpolation loop - spring physics for elastic movement
+  useEffect(() => {
+    if (!joined) return;
+
+    const SPRING_STIFFNESS = 0.15; // How quickly it moves toward target
+    const SPRING_DAMPING = 0.7; // Reduces oscillation
+
+    const interpolate = () => {
+      let updated = false;
+
+      // Update display positions using spring physics
+      Object.keys(targetPositionsRef.current).forEach(userId => {
+        const target = targetPositionsRef.current[userId];
+        const display = displayPositionsRef.current[userId];
+
+        if (!display || !target) return;
+
+        // Spring force toward target
+        const dx = target.x - display.x;
+        const dy = target.y - display.y;
+
+        // Update velocity with spring physics
+        target.vx = (target.vx + dx * SPRING_STIFFNESS) * SPRING_DAMPING;
+        target.vy = (target.vy + dy * SPRING_STIFFNESS) * SPRING_DAMPING;
+
+        // Update display position
+        display.x += target.vx;
+        display.y += target.vy;
+
+        // Snap to target if very close (prevents infinite tiny movements)
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance < 0.5 && Math.abs(target.vx) < 0.1 && Math.abs(target.vy) < 0.1) {
+          display.x = target.x;
+          display.y = target.y;
+          target.vx = 0;
+          target.vy = 0;
+        }
+
+        // Update user state with interpolated position
+        setUsers(prev => prev.map(u =>
+          u.id === userId ? { ...u, x: display.x, y: display.y } : u
+        ));
+
+        updated = true;
+      });
+
+      if (updated) {
+        requestAnimationFrame(interpolate);
+      } else {
+        // Keep running even if nothing to update
+        setTimeout(() => requestAnimationFrame(interpolate), 16);
+      }
+    };
+
+    const animationId = requestAnimationFrame(interpolate);
+
+    return () => {
+      cancelAnimationFrame(animationId);
+    };
+  }, [joined]);
+
+  // Create WebRTC peer connection for a user
+  const createPeerConnection = useCallback(async (userId) => {
+    if (peerConnectionsRef.current[userId]) return;
+    if (!localStreamRef.current) return;
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    });
+
+    peerConnectionsRef.current[userId] = pc;
+
+    // Add local audio tracks
+    localStreamRef.current.getTracks().forEach(track => {
+      pc.addTrack(track, localStreamRef.current);
+    });
+
+    // Handle incoming audio
+    pc.ontrack = (event) => {
+      console.log('Received remote track from', userId);
+      const stream = event.streams[0];
+
+      // Create spatial audio nodes
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      const gainNode = audioContextRef.current.createGain();
+      const panNode = audioContextRef.current.createStereoPanner();
+
+      source.connect(gainNode);
+      gainNode.connect(panNode);
+      panNode.connect(audioContextRef.current.destination);
+
+      audioNodesRef.current[userId] = { source, gainNode, panNode };
+    };
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate && socketRef.current) {
+        socketRef.current.emit('webrtc-ice-candidate', {
+          to: userId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`ICE connection state with ${userId}:`, pc.iceConnectionState);
+    };
+
+    return pc;
   }, []);
+
+  // Handle incoming WebRTC offer
+  const handleWebRTCOffer = useCallback(async (from, offer) => {
+    const pc = await createPeerConnection(from);
+    if (!pc) return;
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    socketRef.current.emit('webrtc-answer', {
+      to: from,
+      answer: answer
+    });
+  }, [createPeerConnection]);
+
+  // Handle incoming WebRTC answer
+  const handleWebRTCAnswer = useCallback(async (from, answer) => {
+    const pc = peerConnectionsRef.current[from];
+    if (!pc) return;
+
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  }, []);
+
+  // Handle incoming ICE candidate
+  const handleICECandidate = useCallback(async (from, candidate) => {
+    const pc = peerConnectionsRef.current[from];
+    if (!pc) return;
+
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  }, []);
+
+  // Close peer connection
+  const closePeerConnection = useCallback((userId) => {
+    // Clean up audio nodes
+    if (audioNodesRef.current[userId]) {
+      const { source, gainNode, panNode } = audioNodesRef.current[userId];
+      source.disconnect();
+      gainNode.disconnect();
+      panNode.disconnect();
+      delete audioNodesRef.current[userId];
+    }
+
+    // Close WebRTC connection
+    if (peerConnectionsRef.current[userId]) {
+      peerConnectionsRef.current[userId].close();
+      delete peerConnectionsRef.current[userId];
+    }
+  }, []);
+
+  // Initiate connection when a new user joins
+  useEffect(() => {
+    if (!webrtcReady || !socketRef.current) return;
+
+    const initiateConnection = async (user) => {
+      if (user.id === myId) return;
+
+      const pc = await createPeerConnection(user.id);
+      if (!pc) return;
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      socketRef.current.emit('webrtc-offer', {
+        to: user.id,
+        offer: offer
+      });
+    };
+
+    // Connect to existing users
+    users.forEach(user => {
+      if (user.id !== myId && !peerConnectionsRef.current[user.id]) {
+        initiateConnection(user);
+      }
+    });
+  }, [users, myId, webrtcReady, createPeerConnection]);
 
   // Update spatial audio based on positions
   useEffect(() => {
@@ -433,12 +702,19 @@ const SpatialWhiteboard = () => {
 
     if (dragging) {
       const { x, y } = getCanvasCoordinates(e.clientX, e.clientY);
-      
-      setUsers(prev => prev.map(u => 
-        u.id === myId 
-          ? { ...u, x: x - dragging.offsetX, y: y - dragging.offsetY }
+      const newX = x - dragging.offsetX;
+      const newY = y - dragging.offsetY;
+
+      setUsers(prev => prev.map(u =>
+        u.id === myId
+          ? { ...u, x: newX, y: newY }
           : u
       ));
+
+      // Broadcast position to server
+      if (socketRef.current && wsConnected) {
+        socketRef.current.emit('update-position', { x: newX, y: newY });
+      }
     }
   };
 
@@ -456,20 +732,39 @@ const SpatialWhiteboard = () => {
 
   // Toggle mute
   const toggleMute = () => {
-    setIsMuted(!isMuted);
-    setUsers(prev => prev.map(u => 
-      u.id === myId ? { ...u, isMuted: !isMuted } : u
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+    setUsers(prev => prev.map(u =>
+      u.id === myId ? { ...u, isMuted: newMuted } : u
     ));
+
+    // Mute/unmute local audio track
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = !newMuted;
+      });
+    }
+
+    // Broadcast state to server
+    if (socketRef.current && wsConnected) {
+      socketRef.current.emit('update-state', { isMuted: newMuted });
+    }
   };
 
   // Toggle megaphone (admin only)
   const toggleMegaphone = () => {
     const me = users.find(u => u.id === myId);
     if (!me?.isAdmin) return;
-    
-    setUsers(prev => prev.map(u => 
-      u.id === myId ? { ...u, megaphoneActive: !u.megaphoneActive } : u
+
+    const newMegaphoneState = !me.megaphoneActive;
+    setUsers(prev => prev.map(u =>
+      u.id === myId ? { ...u, megaphoneActive: newMegaphoneState } : u
     ));
+
+    // Broadcast state to server
+    if (socketRef.current && wsConnected) {
+      socketRef.current.emit('update-state', { megaphoneActive: newMegaphoneState });
+    }
   };
 
   // Teleport to user with smooth animation
@@ -598,21 +893,6 @@ const SpatialWhiteboard = () => {
 
   return (
     <div className="relative w-screen h-screen overflow-hidden">
-      {/* Hidden VDO.Ninja iframe for WebRTC */}
-      <iframe
-        ref={vdoIframeRef}
-        src={`https://vdo.ninja/?room=${roomId}&push=${myId}&label=${encodeURIComponent(myName)}&audioonly&screenshare=0&novideo&api`}
-        allow="camera;microphone;display-capture;autoplay;clipboard-write"
-        style={{ 
-          position: 'absolute', 
-          width: '1px', 
-          height: '1px', 
-          border: 'none',
-          opacity: 0,
-          pointerEvents: 'none'
-        }}
-      />
-      
       {/* Canvas */}
       <canvas
         ref={canvasRef}
@@ -627,11 +907,19 @@ const SpatialWhiteboard = () => {
       
       {/* Controls */}
       <div className="absolute top-4 left-4 bg-white rounded-lg shadow-lg p-4 space-y-2">
-        <div className="flex items-center gap-2 pb-2 border-b border-gray-200">
-          <Radio size={16} className={vdoReady ? 'text-green-500' : 'text-gray-400'} />
-          <span className="text-xs text-gray-600">
-            {vdoReady ? 'WebRTC Connected' : 'Connecting...'}
-          </span>
+        <div className="space-y-1 pb-2 border-b border-gray-200">
+          <div className="flex items-center gap-2">
+            <Radio size={16} className={wsConnected ? 'text-green-500' : 'text-gray-400'} />
+            <span className="text-xs text-gray-600">
+              {wsConnected ? 'Server Connected' : 'Server Offline'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Radio size={16} className={webrtcReady ? 'text-green-500' : 'text-gray-400'} />
+            <span className="text-xs text-gray-600">
+              {webrtcReady ? 'Microphone Active' : 'Requesting Mic...'}
+            </span>
+          </div>
         </div>
         
         <button
