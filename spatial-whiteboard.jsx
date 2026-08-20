@@ -69,6 +69,10 @@ const SpatialWhiteboard = () => {
   const peerConnectionsRef = useRef({}); // { userId: RTCPeerConnection }
   const audioNodesRef = useRef({}); // { userId: { source, gainNode, panNode } }
 
+  // IDs this client should initiate offers to. Only existing room members offer
+  // to a newcomer; the newcomer only answers. (One offerer per pair = no glare.)
+  const offerToRef = useRef(new Set());
+
   // Interpolation refs - track target positions for smooth movement
   const targetPositionsRef = useRef({}); // { userId: { x, y, vx, vy } }
   const displayPositionsRef = useRef({}); // Current rendered positions
@@ -176,6 +180,10 @@ const SpatialWhiteboard = () => {
       displayPositionsRef.current[user.id] = { x: user.x, y: user.y };
       targetPositionsRef.current[user.id] = { x: user.x, y: user.y, vx: 0, vy: 0 };
 
+      // This event only reaches clients already in the room, so we are the
+      // existing member: we offer, the newcomer answers.
+      offerToRef.current.add(user.id);
+
       setUsers(prev => {
         if (prev.find(u => u.id === user.id)) return prev;
         return [...prev, user];
@@ -213,6 +221,7 @@ const SpatialWhiteboard = () => {
       // Clean up interpolation data
       delete displayPositionsRef.current[userId];
       delete targetPositionsRef.current[userId];
+      offerToRef.current.delete(userId);
 
       // Clean up WebRTC connection
       closePeerConnection(userId);
@@ -307,7 +316,7 @@ const SpatialWhiteboard = () => {
 
   // Create WebRTC peer connection for a user
   const createPeerConnection = useCallback(async (userId) => {
-    if (peerConnectionsRef.current[userId]) return;
+    if (peerConnectionsRef.current[userId]) return peerConnectionsRef.current[userId];
     if (!localStreamRef.current) return;
 
     const pc = new RTCPeerConnection({
@@ -362,6 +371,12 @@ const SpatialWhiteboard = () => {
   const handleWebRTCOffer = useCallback(async (from, offer) => {
     const pc = await createPeerConnection(from);
     if (!pc) return;
+
+    // Defensive: if a local offer is somehow outstanding (offer glare),
+    // roll back before answering so the remote offer can always be applied.
+    if (pc.signalingState !== 'stable') {
+      await pc.setLocalDescription({ type: 'rollback' });
+    }
 
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
     const answer = await pc.createAnswer();
@@ -426,9 +441,10 @@ const SpatialWhiteboard = () => {
       });
     };
 
-    // Connect to existing users
+    // Offer only to users who joined after us (they were added to offerToRef
+    // by the user-joined handler). Newcomers never offer — they answer.
     users.forEach(user => {
-      if (user.id !== myId && !peerConnectionsRef.current[user.id]) {
+      if (user.id !== myId && !peerConnectionsRef.current[user.id] && offerToRef.current.has(user.id)) {
         initiateConnection(user);
       }
     });
@@ -801,6 +817,11 @@ const SpatialWhiteboard = () => {
         u.id === myId ? { ...u, x: newX, y: newY } : u
       ));
       
+      // Broadcast each step so remote clients see (and hear) the approach
+      if (socketRef.current && wsConnected) {
+        socketRef.current.emit('update-position', { x: newX, y: newY });
+      }
+      
       // Also update view to follow
       const canvas = canvasRef.current;
       const centerX = (canvas.offsetWidth / 2) / zoom;
@@ -881,7 +902,7 @@ const SpatialWhiteboard = () => {
               <li>• Volume adjusts based on distance</li>
               <li>• Scroll to zoom in/out</li>
               <li>• Shift+drag or middle-click to pan</li>
-              <li>• Real WebRTC audio via VDO.Ninja</li>
+              <li>• Real peer-to-peer WebRTC audio</li>
             </ul>
           </div>
         </div>
